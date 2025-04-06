@@ -5,6 +5,8 @@ import pyodbc
 import json
 from azure.identity import ClientSecretCredential
 from dotenv import load_dotenv
+from functools import wraps
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -21,6 +23,107 @@ port = os.getenv('SQL_PORT')
 
 # Check if running in Azure
 is_azure = os.getenv('WEBSITE_INSTANCE_ID') is not None
+
+# Connection pool
+_connection_pool = {}
+_connection_pool_lock = threading.Lock()
+
+def get_db_connection():
+    """Get a database connection from the pool or create a new one"""
+    thread_id = threading.get_ident()
+    
+    with _connection_pool_lock:
+        if thread_id in _connection_pool:
+            try:
+                # Test if connection is still alive
+                _connection_pool[thread_id].cursor().execute("SELECT 1")
+                return _connection_pool[thread_id]
+            except:
+                # Connection is dead, remove it
+                del _connection_pool[thread_id]
+        
+        # Create new connection
+        token = get_access_token()
+        connection_string = (
+            f"Driver={{ODBC Driver 17 for SQL Server}};"
+            f"Server=tcp:{server},{port};"
+            f"Database={database};"
+            "Encrypt=yes;"
+            "TrustServerCertificate=no;"
+            "Connection Timeout=30;"
+            "Authentication=ActiveDirectoryServicePrincipal;"
+            f"UID={client_id}@{tenant_id};"
+            f"PWD={client_secret};"
+        )
+        
+        conn = pyodbc.connect(connection_string)
+        _connection_pool[thread_id] = conn
+        return conn
+
+def require_auth(f):
+    """Decorator to handle authentication"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        req = args[0]
+        is_authenticated, error_message = check_authentication(req)
+        if not is_authenticated:
+            return func.HttpResponse(error_message, status_code=401)
+        return f(*args, **kwargs)
+    return decorated_function
+
+def format_response(data, status_code=200):
+    """Helper function to format consistent responses"""
+    return func.HttpResponse(
+        json.dumps(data, default=str),
+        mimetype="application/json",
+        status_code=status_code
+    )
+
+# Cache for schema
+_schema_cache = None
+_schema_cache_lock = threading.Lock()
+
+def get_cached_schema():
+    """Get schema from cache or fetch from database"""
+    global _schema_cache
+    
+    with _schema_cache_lock:
+        if _schema_cache is None:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT 
+                    c.COLUMN_NAME,
+                    c.DATA_TYPE,
+                    c.CHARACTER_MAXIMUM_LENGTH,
+                    c.IS_NULLABLE,
+                    COLUMNPROPERTY(OBJECT_ID('StationTracking'), c.COLUMN_NAME, 'IsIdentity') as IS_IDENTITY,
+                    CASE 
+                        WHEN c.DATA_TYPE = 'bit' THEN 'bit'
+                        WHEN c.DATA_TYPE IN ('int', 'bigint', 'smallint', 'tinyint') THEN 'number'
+                        ELSE 'text'
+                    END as INPUT_TYPE
+                FROM INFORMATION_SCHEMA.COLUMNS c
+                WHERE c.TABLE_NAME = 'StationTracking'
+                ORDER BY c.ORDINAL_POSITION
+            """)
+            
+            columns = []
+            for row in cursor.fetchall():
+                column = {
+                    'name': row[0],
+                    'type': row[1],
+                    'max_length': row[2],
+                    'is_nullable': row[3] == 'YES',
+                    'is_identity': bool(row[4]),
+                    'input_type': row[5]
+                }
+                columns.append(column)
+            
+            _schema_cache = columns
+        
+        return _schema_cache
 
 def check_authentication(req: func.HttpRequest) -> tuple[bool, str]:
     """Check if the request is authenticated and from the correct tenant"""
@@ -51,23 +154,6 @@ def get_access_token():
     # Get token for SQL Server resource
     access_token = credential.get_token("https://database.windows.net/.default")
     return access_token.token
-
-def get_db_connection():
-    """Create a database connection using Service Principal authentication"""
-    token = get_access_token()
-    connection_string = (
-        f"Driver={{ODBC Driver 17 for SQL Server}};"
-        f"Server=tcp:{server},{port};"
-        f"Database={database};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=no;"
-        "Connection Timeout=30;"
-        "Authentication=ActiveDirectoryServicePrincipal;"
-        f"UID={client_id}@{tenant_id};"
-        f"PWD={client_secret};"
-    )
-    logging.info(f"Attempting to connect with connection string: {connection_string}")
-    return pyodbc.connect(connection_string)
 
 # Set auth level based on environment
 auth_level = func.AuthLevel.ANONYMOUS if not is_azure else func.AuthLevel.FUNCTION
@@ -616,73 +702,18 @@ def serve_ui(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 @app.route(route="schema", auth_level=auth_level)
+@require_auth
 def get_schema(req: func.HttpRequest) -> func.HttpResponse:
-    # Check authentication
-    is_authenticated, error_message = check_authentication(req)
-    if not is_authenticated:
-        return func.HttpResponse(error_message, status_code=401)
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Get column information
-        cursor.execute("""
-            SELECT 
-                c.COLUMN_NAME,
-                c.DATA_TYPE,
-                c.CHARACTER_MAXIMUM_LENGTH,
-                c.IS_NULLABLE,
-                COLUMNPROPERTY(OBJECT_ID('StationTracking'), c.COLUMN_NAME, 'IsIdentity') as IS_IDENTITY,
-                CASE 
-                    WHEN c.DATA_TYPE = 'bit' THEN 'bit'
-                    WHEN c.DATA_TYPE IN ('int', 'bigint', 'smallint', 'tinyint') THEN 'number'
-                    ELSE 'text'
-                END as INPUT_TYPE
-            FROM INFORMATION_SCHEMA.COLUMNS c
-            WHERE c.TABLE_NAME = 'StationTracking'
-            ORDER BY c.ORDINAL_POSITION
-        """)
-        
-        columns = []
-        rows = cursor.fetchall()
-        if not rows:
-            raise Exception("No schema information found for StationTracking table")
-            
-        for row in rows:
-            column = {
-                'name': row[0],
-                'type': row[1],
-                'max_length': row[2],
-                'is_nullable': row[3] == 'YES',
-                'is_identity': bool(row[4]),
-                'input_type': row[5]
-            }
-            columns.append(column)
-        
-        cursor.close()
-        conn.close()
-        
-        if not columns:
-            raise Exception("No columns found in schema")
-            
-        return func.HttpResponse(
-            json.dumps({"columns": columns}),
-            mimetype="application/json",
-            status_code=200
-        )
+        schema = get_cached_schema()
+        return format_response({"columns": schema})
     except Exception as e:
         logging.error(f"Error getting schema: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500
-        )
+        return format_response({"error": str(e)}, 500)
 
 @app.route(route="stations", methods=["GET"], auth_level=auth_level)
+@require_auth
 def get_stations(req: func.HttpRequest) -> func.HttpResponse:
-    # Check authentication
-    is_authenticated, error_message = check_authentication(req)
-    if not is_authenticated:
-        return func.HttpResponse(error_message, status_code=401)
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -695,196 +726,125 @@ def get_stations(req: func.HttpRequest) -> func.HttpResponse:
             station = dict(zip(columns, row))
             stations.append(station)
         
-        cursor.close()
-        conn.close()
-        
-        return func.HttpResponse(
-            json.dumps({"stations": stations}, default=str),
-            mimetype="application/json",
-            status_code=200
-        )
+        return format_response({"stations": stations})
     except Exception as e:
         logging.error(f"Error getting stations: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500
-        )
+        return format_response({"error": str(e)}, 500)
 
 @app.route(route="stations", methods=["POST"], auth_level=auth_level)
+@require_auth
 def create_station(req: func.HttpRequest) -> func.HttpResponse:
-    # Check authentication
-    is_authenticated, error_message = check_authentication(req)
-    if not is_authenticated:
-        return func.HttpResponse(error_message, status_code=401)
     try:
         req_body = req.get_json()
         if not req_body:
             raise ValueError("Request body is empty")
 
-        # Remove ID if present (it's an identity column)
         if 'ID' in req_body:
             del req_body['ID']
 
-        # Ensure IsActive is present and boolean
         if 'IsActive' in req_body:
             req_body['IsActive'] = bool(req_body['IsActive'])
         else:
-            req_body['IsActive'] = True  # Default to True if not provided
+            req_body['IsActive'] = True
 
         conn = get_db_connection()
         cursor = conn.cursor()
 
         try:
-            # Build the INSERT statement dynamically
             columns = ', '.join(req_body.keys())
             values = ', '.join(['?' for _ in req_body])
             sql = f"INSERT INTO StationTracking ({columns}) OUTPUT INSERTED.* VALUES ({values})"
 
-            # Execute the INSERT and get the inserted row directly
             cursor.execute(sql, list(req_body.values()))
             row = cursor.fetchone()
             
             if not row:
                 raise Exception("Failed to retrieve newly created station")
 
-            # Get column names from cursor description
             columns = [column[0] for column in cursor.description]
             new_station = dict(zip(columns, row))
 
             conn.commit()
-            return func.HttpResponse(
-                json.dumps({"station": new_station}, default=str),
-                mimetype="application/json",
-                status_code=201
-            )
+            return format_response({"station": new_station}, 201)
         finally:
             cursor.close()
-            conn.close()
 
     except Exception as e:
         logging.error(f"Error creating station: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500
-        )
+        return format_response({"error": str(e)}, 500)
 
 @app.route(route="stations/{id}", methods=["PUT"], auth_level=auth_level)
+@require_auth
 def update_station(req: func.HttpRequest) -> func.HttpResponse:
-    # Check authentication
-    is_authenticated, error_message = check_authentication(req)
-    if not is_authenticated:
-        return func.HttpResponse(error_message, status_code=401)
     try:
         station_id = req.route_params.get('id')
         req_body = req.get_json()
         
-        # Remove ID if present (we don't want to update it)
         if 'ID' in req_body:
             del req_body['ID']
         
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Build the UPDATE statement dynamically
         set_clause = ', '.join([f"{k} = ?" for k in req_body.keys()])
         sql = f"UPDATE StationTracking SET {set_clause} WHERE ID = ?"
         
-        # Execute the UPDATE
         params = list(req_body.values()) + [station_id]
         cursor.execute(sql, params)
         conn.commit()
         
-        # Get the updated record
         cursor.execute("SELECT * FROM StationTracking WHERE ID = ?", station_id)
         columns = [column[0] for column in cursor.description]
         updated_station = dict(zip(columns, cursor.fetchone()))
         
-        cursor.close()
-        conn.close()
-        
-        return func.HttpResponse(
-            json.dumps({"station": updated_station}, default=str),
-            mimetype="application/json",
-             status_code=200
-        )
+        return format_response({"station": updated_station})
     except Exception as e:
         logging.error(f"Error updating station: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500
-        )
+        return format_response({"error": str(e)}, 500)
 
 @app.route(route="stations/{id}", methods=["DELETE"], auth_level=auth_level)
+@require_auth
 def delete_station(req: func.HttpRequest) -> func.HttpResponse:
-    # Check authentication
-    is_authenticated, error_message = check_authentication(req)
-    if not is_authenticated:
-        return func.HttpResponse(error_message, status_code=401)
     try:
         station_id = req.route_params.get('id')
         
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Delete the station
         cursor.execute("DELETE FROM StationTracking WHERE ID = ?", station_id)
         conn.commit()
-        
-        cursor.close()
-        conn.close()
         
         return func.HttpResponse(status_code=204)
     except Exception as e:
         logging.error(f"Error deleting station: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500
-        )
+        return format_response({"error": str(e)}, 500)
 
 @app.route(route="stations/clone/{id}", methods=["POST"], auth_level=auth_level)
+@require_auth
 def clone_station(req: func.HttpRequest) -> func.HttpResponse:
-    # Check authentication
-    is_authenticated, error_message = check_authentication(req)
-    if not is_authenticated:
-        return func.HttpResponse(error_message, status_code=401)
     try:
         station_id = req.route_params.get('id')
         
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Get the source station
         cursor.execute("SELECT * FROM StationTracking WHERE ID = ?", station_id)
         columns = [column[0] for column in cursor.description]
         source_station = dict(zip(columns, cursor.fetchone()))
         
-        # Remove the ID for the new record
         del source_station['ID']
         
-        # Build the INSERT statement dynamically
         columns = ', '.join(source_station.keys())
         values = ', '.join(['?' for _ in source_station])
         sql = f"INSERT INTO StationTracking ({columns}) VALUES ({values})"
         
-        # Execute the INSERT
         cursor.execute(sql, list(source_station.values()))
         conn.commit()
         
-        # Get the newly created record
         cursor.execute("SELECT * FROM StationTracking WHERE ID = SCOPE_IDENTITY()")
         new_station = dict(zip(columns.split(','), cursor.fetchone()))
         
-        cursor.close()
-        conn.close()
-        
-        return func.HttpResponse(
-            json.dumps({"station": new_station}, default=str),
-            mimetype="application/json",
-            status_code=201
-        )
+        return format_response({"station": new_station}, 201)
     except Exception as e:
         logging.error(f"Error cloning station: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"error": str(e)}),
-            status_code=500
-        )
+        return format_response({"error": str(e)}, 500)
