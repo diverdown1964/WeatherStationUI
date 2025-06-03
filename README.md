@@ -4,7 +4,7 @@ A simple Azure Functions application that will serve as the backend for the Weat
 
 ## Prerequisites
 
-- Python 3.9 or higher
+- Python 3.12
 - Azure Functions Core Tools version 4.x
 - Azure CLI (for deployment)
 - Visual Studio Code with Azure Functions extension (recommended)

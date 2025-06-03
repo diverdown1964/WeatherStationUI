@@ -7,6 +7,7 @@ from azure.identity import ClientSecretCredential
 from dotenv import load_dotenv
 from functools import wraps
 import threading
+import asyncio
 
 # Load environment variables
 load_dotenv()
@@ -45,7 +46,7 @@ def get_db_connection():
         # Create new connection
         token = get_access_token()
         connection_string = (
-            f"Driver={{ODBC Driver 17 for SQL Server}};"
+            f"Driver={{ODBC Driver 18 for SQL Server}};"
             f"Server=tcp:{server},{port};"
             f"Database={database};"
             "Encrypt=yes;"
@@ -63,12 +64,11 @@ def get_db_connection():
 def require_auth(f):
     """Decorator to handle authentication"""
     @wraps(f)
-    def decorated_function(*args, **kwargs):
-        req = args[0]
+    async def decorated_function(req: func.HttpRequest, *args, **kwargs):
         is_authenticated, error_message = check_authentication(req)
         if not is_authenticated:
             return func.HttpResponse(error_message, status_code=401)
-        return f(*args, **kwargs)
+        return await f(req, *args, **kwargs) if asyncio.iscoroutinefunction(f) else f(req, *args, **kwargs)
     return decorated_function
 
 def format_response(data, status_code=200):
@@ -89,44 +89,63 @@ def get_cached_schema():
     
     with _schema_cache_lock:
         if _schema_cache is None:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT 
-                    c.COLUMN_NAME,
-                    c.DATA_TYPE,
-                    c.CHARACTER_MAXIMUM_LENGTH,
-                    c.IS_NULLABLE,
-                    COLUMNPROPERTY(OBJECT_ID('StationTracking'), c.COLUMN_NAME, 'IsIdentity') as IS_IDENTITY,
-                    CASE 
-                        WHEN c.DATA_TYPE = 'bit' THEN 'bit'
-                        WHEN c.DATA_TYPE IN ('int', 'bigint', 'smallint', 'tinyint') THEN 'number'
-                        ELSE 'text'
-                    END as INPUT_TYPE
-                FROM INFORMATION_SCHEMA.COLUMNS c
-                WHERE c.TABLE_NAME = 'StationTracking'
-                ORDER BY c.ORDINAL_POSITION
-            """)
-            
-            columns = []
-            for row in cursor.fetchall():
-                column = {
-                    'name': row[0],
-                    'type': row[1],
-                    'max_length': row[2],
-                    'is_nullable': row[3] == 'YES',
-                    'is_identity': bool(row[4]),
-                    'input_type': row[5]
-                }
-                columns.append(column)
-            
-            _schema_cache = columns
+            try:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                
+                # First verify the table exists
+                cursor.execute("""
+                    SELECT COUNT(*) 
+                    FROM sys.tables 
+                    WHERE name = 'StationTracking'
+                """)
+                if cursor.fetchone()[0] == 0:
+                    raise Exception("Table 'StationTracking' does not exist")
+                
+                cursor.execute("""
+                    SELECT 
+                        c.name as COLUMN_NAME,
+                        t.name as DATA_TYPE,
+                        c.max_length as CHARACTER_MAXIMUM_LENGTH,
+                        CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END as IS_NULLABLE,
+                        CASE WHEN c.is_identity = 1 THEN 1 ELSE 0 END as IS_IDENTITY,
+                        CASE 
+                            WHEN t.name = 'bit' THEN 'bit'
+                            WHEN t.name IN ('int', 'bigint', 'smallint', 'tinyint') THEN 'number'
+                            ELSE 'text'
+                        END as INPUT_TYPE
+                    FROM sys.columns c
+                    JOIN sys.types t ON c.user_type_id = t.user_type_id
+                    WHERE c.object_id = OBJECT_ID('StationTracking')
+                    ORDER BY c.column_id
+                """)
+                
+                columns = []
+                for row in cursor.fetchall():
+                    column = {
+                        'name': row[0],
+                        'type': row[1],
+                        'max_length': row[2],
+                        'is_nullable': row[3] == 'YES',
+                        'is_identity': bool(row[4]),
+                        'input_type': row[5]
+                    }
+                    columns.append(column)
+                
+                _schema_cache = columns
+                logging.info(f"Successfully retrieved schema with {len(columns)} columns")
+            except Exception as e:
+                logging.error(f"Error in get_cached_schema: {str(e)}")
+                raise
         
         return _schema_cache
 
 def check_authentication(req: func.HttpRequest) -> tuple[bool, str]:
     """Check if the request is authenticated and from the correct tenant"""
+    # Skip authentication for UI endpoint
+    if req.route_params.get('route') == 'ui':
+        return True, ""
+    
     if not is_azure:
         return True, ""
     
@@ -161,12 +180,8 @@ auth_level = func.AuthLevel.ANONYMOUS if not is_azure else func.AuthLevel.FUNCTI
 app = func.FunctionApp(http_auth_level=auth_level)
 
 @app.route(route="ui", methods=["GET"])
-def serve_ui(req: func.HttpRequest) -> func.HttpResponse:
-    # Check authentication
-    is_authenticated, error_message = check_authentication(req)
-    if not is_authenticated:
-        return func.HttpResponse(error_message, status_code=401)
-
+async def serve_ui(req: func.HttpRequest) -> func.HttpResponse:
+    # No authentication check for UI endpoint
     html_content = """
 <!DOCTYPE html>
 <html lang="en">
@@ -701,9 +716,9 @@ def serve_ui(req: func.HttpRequest) -> func.HttpResponse:
         status_code=200
     )
 
-@app.route(route="schema", auth_level=auth_level)
+@app.route(route="schema")
 @require_auth
-def get_schema(req: func.HttpRequest) -> func.HttpResponse:
+async def get_schema(req: func.HttpRequest) -> func.HttpResponse:
     try:
         schema = get_cached_schema()
         return format_response({"columns": schema})
@@ -713,7 +728,7 @@ def get_schema(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="stations", methods=["GET"], auth_level=auth_level)
 @require_auth
-def get_stations(req: func.HttpRequest) -> func.HttpResponse:
+async def get_stations(req: func.HttpRequest) -> func.HttpResponse:
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -733,7 +748,7 @@ def get_stations(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="stations", methods=["POST"], auth_level=auth_level)
 @require_auth
-def create_station(req: func.HttpRequest) -> func.HttpResponse:
+async def create_station(req: func.HttpRequest) -> func.HttpResponse:
     try:
         req_body = req.get_json()
         if not req_body:
@@ -775,7 +790,7 @@ def create_station(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="stations/{id}", methods=["PUT"], auth_level=auth_level)
 @require_auth
-def update_station(req: func.HttpRequest) -> func.HttpResponse:
+async def update_station(req: func.HttpRequest) -> func.HttpResponse:
     try:
         station_id = req.route_params.get('id')
         req_body = req.get_json()
@@ -804,7 +819,7 @@ def update_station(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="stations/{id}", methods=["DELETE"], auth_level=auth_level)
 @require_auth
-def delete_station(req: func.HttpRequest) -> func.HttpResponse:
+async def delete_station(req: func.HttpRequest) -> func.HttpResponse:
     try:
         station_id = req.route_params.get('id')
         
@@ -821,7 +836,7 @@ def delete_station(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="stations/clone/{id}", methods=["POST"], auth_level=auth_level)
 @require_auth
-def clone_station(req: func.HttpRequest) -> func.HttpResponse:
+async def clone_station(req: func.HttpRequest) -> func.HttpResponse:
     try:
         station_id = req.route_params.get('id')
         
